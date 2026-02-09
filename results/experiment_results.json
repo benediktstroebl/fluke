@@ -1,0 +1,158 @@
+{
+  "experiment_1_scoring": {
+    "term_importance": {
+      "maxsim": {
+        "relevant": 1.0369406938552856,
+        "irrelevant": 1.8451316356658936,
+        "correct": false
+      },
+      "soft_topk": {
+        "relevant": 0.9651547074317932,
+        "irrelevant": 1.802123785018921,
+        "correct": false
+      },
+      "cqi_stk": {
+        "relevant": 2.707791805267334,
+        "irrelevant": 1.9411176443099976,
+        "correct": true
+      }
+    },
+    "spurious_match": {
+      "maxsim": {
+        "relevant": 0.9191017150878906,
+        "irrelevant": 1.6541390419006348,
+        "correct": false
+      },
+      "soft_topk": {
+        "relevant": 0.8134318590164185,
+        "irrelevant": 1.6018884181976318,
+        "correct": false
+      },
+      "cqi_stk": {
+        "relevant": 0.8134318590164185,
+        "irrelevant": 1.6018884181976318,
+        "correct": false
+      }
+    },
+    "conjunction": {
+      "maxsim": {
+        "relevant": 1.2476454973220825,
+        "irrelevant": 1.0407536029815674,
+        "correct": true
+      },
+      "soft_topk": {
+        "relevant": 1.2401930093765259,
+        "irrelevant": 1.0253597497940063,
+        "correct": true
+      },
+      "cqi_stk": {
+        "relevant": 1.8602895736694336,
+        "irrelevant": 1.5380396842956543,
+        "correct": true
+      }
+    },
+    "statistical": {
+      "term_importance": {
+        "maxsim": {
+          "accuracy": 0.0,
+          "mean_margin": -0.7862155736684799,
+          "std_margin": 0.10185971250771673
+        },
+        "soft_topk": {
+          "accuracy": 0.0,
+          "mean_margin": -0.8166323279738427,
+          "std_margin": 0.0943141839142538
+        },
+        "cqi_stk": {
+          "accuracy": 1.0,
+          "mean_margin": 0.8014944188594818,
+          "std_margin": 0.18588751069042084
+        }
+      },
+      "spurious_match": {
+        "maxsim": {
+          "accuracy": 0.0,
+          "mean_margin": -0.7979900749027729,
+          "std_margin": 0.1382391292992962
+        },
+        "soft_topk": {
+          "accuracy": 0.0,
+          "mean_margin": -0.8313590109348297,
+          "std_margin": 0.13896929747686784
+        },
+        "cqi_stk": {
+          "accuracy": 0.0,
+          "mean_margin": -0.8313590109348297,
+          "std_margin": 0.13896929747686784
+        }
+      },
+      "conjunction": {
+        "maxsim": {
+          "accuracy": 0.999,
+          "mean_margin": 0.29482389587163926,
+          "std_margin": 0.09300968437205791
+        },
+        "soft_topk": {
+          "accuracy": 0.999,
+          "mean_margin": 0.31818355280160904,
+          "std_margin": 0.09360665000808828
+        },
+        "cqi_stk": {
+          "accuracy": 0.999,
+          "mean_margin": 0.47727532613277435,
+          "std_margin": 0.1404099768031756
+        }
+      }
+    }
+  },
+  "experiment_2_e2e": {
+    "ColBERTv2": {
+      "nDCG@10": 0.4374954351418122,
+      "MAP@10": 0.16068777777777776,
+      "Recall@100": 0.682
+    },
+    "FLUKE": {
+      "nDCG@10": 0.43559184438809745,
+      "MAP@10": 0.16047880952380952,
+      "Recall@100": 0.6678
+    }
+  },
+  "experiment_3_ablation": {
+    "ColBERTv2 (baseline)": {
+      "nDCG@10": 0.4374954351418122,
+      "MAP@10": 0.16068777777777776,
+      "Recall@100": 0.682
+    },
+    "+ CQI only": {
+      "nDCG@10": 0.46006933599889727,
+      "MAP@10": 0.16732095238095238,
+      "Recall@100": 0.7008000000000001
+    },
+    "+ SoftTopK only": {
+      "nDCG@10": 0.42443768301473833,
+      "MAP@10": 0.15406190476190476,
+      "Recall@100": 0.6742
+    },
+    "+ TIR only": {
+      "nDCG@10": 0.449696340792436,
+      "MAP@10": 0.16814531746031747,
+      "Recall@100": 0.6738
+    },
+    "+ CQI + SoftTopK": {
+      "nDCG@10": 0.44153169308898177,
+      "MAP@10": 0.16079904761904762,
+      "Recall@100": 0.6884
+    },
+    "+ CQI + TIR": {
+      "nDCG@10": 0.45097707677233767,
+      "MAP@10": 0.16736261904761904,
+      "Recall@100": 0.6915999999999999
+    },
+    "FLUKE (all)": {
+      "nDCG@10": 0.43559184438809745,
+      "MAP@10": 0.16047880952380952,
+      "Recall@100": 0.6678
+    }
+  },
+  "total_time_seconds": 3869.7626395225525
+}
