@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.so
+.env
+.venv
+venv/
+ENV/
+*.log
+.DS_Store
+# Large result files (keep experiment_results.json tracked)
+datasets/
+indices/
+checkpoints/
+*.pt
+*.bin
+wandb/
+.cache/

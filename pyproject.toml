@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "fluke"
+version = "0.1.0"
+description = "FLUKE: Fused Late-interaction with Unified Key Embeddings — a novel neural retrieval method improving upon ColBERTv2"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.30",
+    "datasets>=2.14",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "scikit-learn>=1.3",
+    "faiss-cpu>=1.7",
+    "tqdm>=4.65",
+    "pytrec-eval-terrier>=0.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "black", "ruff"]
+beir = ["beir>=2.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fluke*"]
