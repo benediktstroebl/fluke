@@ -23,6 +23,7 @@ class LatentSearcher:
         temperature: float = 0.1,
         tir_module: TokenInteractionResidual | None = None,
         max_query_tokens: int = 32,
+        fluke_plus_model=None,
     ):
         self.index = index
         self.scoring = scoring
@@ -30,6 +31,7 @@ class LatentSearcher:
         self.temperature = temperature
         self.tir_module = tir_module
         self.max_query_tokens = max_query_tokens
+        self.fluke_plus_model = fluke_plus_model
 
     def search(
         self,
@@ -54,7 +56,12 @@ class LatentSearcher:
         for i in range(self.index.num_docs):
             doc_embs = self.index.doc_embeddings[i]
 
-            if self.scoring == "fluke" and importance_weights is not None:
+            if self.scoring == "fluke_plus" and self.fluke_plus_model is not None:
+                iw = importance_weights if importance_weights is not None else torch.ones(query_embs.shape[0])
+                score = self.fluke_plus_model.score(
+                    query_embs, doc_embs, iw, query_mask=query_mask,
+                )
+            elif self.scoring == "fluke" and importance_weights is not None:
                 score = fluke_score(
                     query_embs, doc_embs, importance_weights,
                     tir_module=self.tir_module,
