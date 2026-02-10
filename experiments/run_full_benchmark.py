@@ -306,14 +306,13 @@ def _score_scenario(
                 i = i_asc.item()
         elif method == "FLUKE+_Full":
             with torch.no_grad():
-                r_base = fluke_score(query, doc_rel, cw, topk=3, max_query_tokens=32).item()
-                i_base = fluke_score(query, doc_irr, cw, topk=3, max_query_tokens=32).item()
-                r_mgs, _ = mgs(query, doc_rel)
-                i_mgs, _ = mgs(query, doc_irr)
+                # ASC calibrated scores + CQI weights + MGS n-gram correction
                 r_asc, _ = calibrated_score(query, doc_rel, asc, importance_weights=cw)
                 i_asc, _ = calibrated_score(query, doc_irr, asc, importance_weights=cw)
-                r = 0.5 * r_base + 0.3 * r_asc.item() + 0.2 * r_mgs.item()
-                i = 0.5 * i_base + 0.3 * i_asc.item() + 0.2 * i_mgs.item()
+                r_mgs, _ = mgs(query, doc_rel)
+                i_mgs, _ = mgs(query, doc_irr)
+                r = r_asc.item() + r_mgs.item()
+                i = i_asc.item() + i_mgs.item()
         else:
             continue
 
@@ -407,16 +406,25 @@ def generate_synthetic_dataset(
         doc_ids_by_topic[topic_id].append(doc_id)
 
     all_doc_ids = list(corpus.keys())
+    # Generate more triplets with harder negatives (from nearby topics)
     for query_id, query_text in queries.items():
         topic_id = int(query_id.split("_")[1]) // queries_per_topic
         pos_docs = doc_ids_by_topic[topic_id]
         if not pos_docs:
             continue
-        for _ in range(3):
+        for _ in range(5):
             pos_doc_id = rng.choice(pos_docs)
-            neg_doc_id = rng.choice(all_doc_ids)
-            while doc_topics.get(neg_doc_id) == topic_id:
+            # Mix of random negatives and hard negatives (nearby topics)
+            if rng.random() < 0.4:
+                # Hard negative: from a different but overlapping-vocabulary topic
+                other_topics = [t for t in range(n_topics) if t != topic_id]
+                neg_topic = rng.choice(other_topics)
+                neg_docs = doc_ids_by_topic[neg_topic]
+                neg_doc_id = rng.choice(neg_docs) if neg_docs else rng.choice(all_doc_ids)
+            else:
                 neg_doc_id = rng.choice(all_doc_ids)
+                while doc_topics.get(neg_doc_id) == topic_id:
+                    neg_doc_id = rng.choice(all_doc_ids)
             triplets.append((query_text, corpus[pos_doc_id], corpus[neg_doc_id]))
 
     rng.shuffle(triplets)
@@ -601,7 +609,7 @@ def evaluate_retrieval(
     return metrics
 
 
-def run_e2e_experiment(num_epochs=3, train_batch_size=16, lr=1e-4):
+def run_e2e_experiment(num_epochs=6, train_batch_size=16, lr=5e-5):
     """Experiment 2: End-to-end training and retrieval on BEIR + LoTTE style data."""
     print("\n" + "=" * 70)
     print("EXPERIMENT 2: End-to-End Training + Retrieval")
@@ -615,7 +623,8 @@ def run_e2e_experiment(num_epochs=3, train_batch_size=16, lr=1e-4):
     corpus, queries, qrels, triplets = generate_synthetic_dataset(
         n_topics=50, docs_per_topic=20, noise_docs=200, queries_per_topic=5,
     )
-    train_triplets = triplets[:min(len(triplets), 2000)]
+    # Use more triplets for better training
+    train_triplets = triplets[:min(len(triplets), 3000)]
 
     print(f"  Corpus: {len(corpus)} docs, Queries: {len(queries)}, "
           f"Triplets: {len(train_triplets)}")
@@ -668,7 +677,7 @@ def run_e2e_experiment(num_epochs=3, train_batch_size=16, lr=1e-4):
         corpus, queries, qrels, triplets = generate_lotte_style_dataset(
             domain_name=domain, seed=42,
         )
-        train_triplets = triplets[:min(len(triplets), 1500)]
+        train_triplets = triplets[:min(len(triplets), 2000)]
 
         domain_results = {}
         for model_name, config in model_configs.items():
@@ -729,7 +738,7 @@ def run_e2e_experiment(num_epochs=3, train_batch_size=16, lr=1e-4):
 # =============================================================================
 
 
-def run_ablation_study(num_epochs=3, train_batch_size=16, lr=1e-4):
+def run_ablation_study(num_epochs=6, train_batch_size=16, lr=5e-5):
     """Experiment 3: Ablation of all 5 FLUKE+ components."""
     print("\n" + "=" * 70)
     print("EXPERIMENT 3: Component Ablation Study")
@@ -885,9 +894,9 @@ def main():
         "--experiment", choices=["scoring", "e2e", "ablation", "all"],
         default="all", help="Which experiment to run",
     )
-    parser.add_argument("--num-epochs", type=int, default=3)
+    parser.add_argument("--num-epochs", type=int, default=6)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--scoring-trials", type=int, default=1000)
     parser.add_argument("--output", default="results/full_benchmark_results.json")
     args = parser.parse_args()

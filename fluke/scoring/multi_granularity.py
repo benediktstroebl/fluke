@@ -119,18 +119,11 @@ class MultiGranularityScorer(nn.Module):
         super().__init__()
         self.bigram_embedder = NGramEmbedder(embedding_dim, kernel_size=2)
         self.trigram_embedder = NGramEmbedder(embedding_dim, kernel_size=3) if max_kernel >= 3 else None
-
-        # Learned scale weights for combining granularities
-        # Initialize to favor unigram (ColBERTv2 behavior) with small n-gram contribution
-        n_scales = 2 if max_kernel < 3 else 3
-        self.scale_logits = nn.Parameter(torch.tensor(
-            [2.0, 0.5, 0.3][:n_scales]  # softmax -> ~[0.7, 0.15, 0.15]
-        ))
         self.max_kernel = max_kernel
 
-    def get_scale_weights(self) -> torch.Tensor:
-        """Get normalized scale weights via softmax."""
-        return F.softmax(self.scale_logits, dim=0)
+        # Learned scale for n-gram contribution, initialized small so MGS
+        # starts as a small additive correction to the base score
+        self.ngram_scale = nn.Parameter(torch.tensor(0.1))
 
     def compute_ngram_maxsim(
         self,
@@ -161,7 +154,11 @@ class MultiGranularityScorer(nn.Module):
         query_mask: torch.Tensor | None = None,
         doc_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute multi-granularity score.
+        """Compute n-gram matching score (bigram + trigram only).
+
+        The unigram MaxSim is already computed in the base score, so MGS only
+        contributes the ADDITIONAL signal from n-gram matching. This avoids
+        score scale inflation from redundant unigram computation.
 
         Args:
             query_embeddings: (num_query_tokens, dim)
@@ -170,21 +167,18 @@ class MultiGranularityScorer(nn.Module):
             doc_mask: (num_doc_tokens,)
 
         Returns:
-            total_score: scalar combined multi-granularity score
+            ngram_score: scalar n-gram contribution (to be added to base score)
             per_token_unigram_scores: (num_query_tokens,) for downstream use
         """
-        weights = self.get_scale_weights()
-
-        # 1. Unigram MaxSim (standard ColBERTv2)
+        # Compute unigram scores for downstream use (not added to total)
         sim_matrix = query_embeddings @ doc_embeddings.T
         if doc_mask is not None:
             sim_matrix = sim_matrix.masked_fill(~doc_mask.unsqueeze(0), float("-inf"))
         unigram_scores = sim_matrix.max(dim=-1).values
         if query_mask is not None:
             unigram_scores = unigram_scores * query_mask.float()
-        unigram_total = unigram_scores.sum()
 
-        # 2. Bigram MaxSim
+        # Bigram MaxSim
         q_bigrams, q_bi_mask = self.bigram_embedder(query_embeddings, query_mask)
         d_bigrams, d_bi_mask = self.bigram_embedder(doc_embeddings, doc_mask)
 
@@ -196,7 +190,8 @@ class MultiGranularityScorer(nn.Module):
         else:
             bigram_total = torch.tensor(0.0, device=query_embeddings.device)
 
-        # 3. Trigram MaxSim (if enabled)
+        # Trigram MaxSim (if enabled)
+        trigram_total = torch.tensor(0.0, device=query_embeddings.device)
         if self.trigram_embedder is not None:
             q_trigrams, q_tri_mask = self.trigram_embedder(query_embeddings, query_mask)
             d_trigrams, d_tri_mask = self.trigram_embedder(doc_embeddings, doc_mask)
@@ -206,15 +201,8 @@ class MultiGranularityScorer(nn.Module):
                     q_trigrams, d_trigrams, q_tri_mask, d_tri_mask
                 )
                 trigram_total = trigram_per_token.sum()
-            else:
-                trigram_total = torch.tensor(0.0, device=query_embeddings.device)
 
-            total = (
-                weights[0] * unigram_total
-                + weights[1] * bigram_total
-                + weights[2] * trigram_total
-            )
-        else:
-            total = weights[0] * unigram_total + weights[1] * bigram_total
+        # Combine only n-gram scores with learned scale
+        ngram_score = self.ngram_scale * (bigram_total + trigram_total)
 
-        return total, unigram_scores
+        return ngram_score, unigram_scores

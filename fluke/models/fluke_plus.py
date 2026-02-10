@@ -103,10 +103,9 @@ class FLUKEPlusModel(nn.Module):
         else:
             self.asc = None
 
-        # Learned weight for combining ASC with base scoring
-        # When both ASC and base scoring are active, learn how to blend them
-        if use_asc:
-            self.asc_blend = nn.Parameter(torch.tensor(0.5))
+        # Learned gate for TIR residual (initialized near zero for stability)
+        if use_tir:
+            self.tir_gate = nn.Parameter(torch.tensor(0.0))
 
     def _compute_base_score(
         self,
@@ -139,47 +138,69 @@ class FLUKEPlusModel(nn.Module):
         query_mask: torch.Tensor | None = None,
         doc_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Score a single query-document pair using full FLUKE+ scoring."""
-        total_score = torch.tensor(0.0, device=query_embs.device)
+        """Score a single query-document pair using full FLUKE+ scoring.
 
-        # Base FLUKE score (CQI + SoftTopK weighted MaxSim)
-        base_score, per_token_scores = self._compute_base_score(
-            query_embs, doc_embs, importance_weights, query_mask, doc_mask
-        )
-
-        # ASC: Adaptive Score Calibration
+        Architecture (designed for same-scale-as-ColBERTv2):
+        1. ASC produces calibrated per-token scores (starts == MaxSim via zero-init)
+        2. CQI importance weights are applied to calibrated scores
+        3. MGS adds a small learned n-gram correction (bigram + trigram only)
+        4. TIR adds a gated residual for cross-term dependencies
+        """
+        # Step 1: Get per-token scores
         if self.asc is not None:
-            asc_score, _ = calibrated_score(
-                query_embs, doc_embs, self.asc,
-                importance_weights=importance_weights,
-                query_mask=query_mask, doc_mask=doc_mask,
+            # ASC: calibrated MaxSim (starts identical to MaxSim, learns to adjust)
+            calibrated_scores, raw_max_sims = self.asc(
+                query_embs, doc_embs, query_mask, doc_mask
             )
-            # Blend base and ASC scores
-            blend = torch.sigmoid(self.asc_blend)
-            total_score = blend * base_score + (1 - blend) * asc_score
+            per_token_scores = calibrated_scores
         else:
-            total_score = base_score
+            # Fallback: standard MaxSim
+            sim_matrix = query_embs @ doc_embs.T
+            if doc_mask is not None:
+                sim_matrix = sim_matrix.masked_fill(~doc_mask.unsqueeze(0), float("-inf"))
+            per_token_scores = sim_matrix.max(dim=-1).values
+            if query_mask is not None:
+                per_token_scores = per_token_scores * query_mask.float()
+            raw_max_sims = per_token_scores
 
-        # MGS: Multi-Granularity Scoring (additive contribution)
+        # Step 2: Apply CQI importance weighting
+        weighted_scores = per_token_scores * importance_weights
+
+        # Step 3: Aggregate (SoftTopK or sum)
+        if self.use_soft_topk:
+            # Sort descending and take soft top-k
+            nq = weighted_scores.shape[0]
+            if nq > self.topk:
+                topk_vals, _ = weighted_scores.topk(self.topk)
+                weights = torch.softmax(topk_vals / self.temperature, dim=0)
+                # Scale by nq/topk so total score is comparable to full sum
+                total_score = (weights * topk_vals).sum() * (nq / self.topk)
+            else:
+                total_score = weighted_scores.sum()
+        else:
+            total_score = weighted_scores.sum()
+
+        # Step 4: MGS n-gram correction (only bigram + trigram, NOT unigram)
         if self.mgs is not None:
             mgs_score, _ = self.mgs(query_embs, doc_embs, query_mask, doc_mask)
             total_score = total_score + mgs_score
 
-        # TIR: Token Interaction Residual
+        # Step 5: TIR residual (gated for stability)
         if self.tir is not None:
-            nq = per_token_scores.shape[0]
+            nq = raw_max_sims.shape[0]
             padded = torch.zeros(
-                self.query_max_length, device=per_token_scores.device
+                self.query_max_length, device=raw_max_sims.device
             )
-            padded[:nq] = per_token_scores
+            padded[:nq] = raw_max_sims
             if query_mask is not None:
                 mask_padded = torch.zeros(
-                    self.query_max_length, device=per_token_scores.device
+                    self.query_max_length, device=raw_max_sims.device
                 )
                 mask_padded[:nq] = query_mask.float()
                 padded = padded * mask_padded
             residual = self.tir(padded.unsqueeze(0))
-            total_score = total_score + residual.squeeze()
+            gate = torch.sigmoid(self.tir_gate)
+            total_score = total_score + gate * residual.squeeze()
 
         return total_score
 

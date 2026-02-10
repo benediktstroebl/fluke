@@ -44,10 +44,15 @@ def collate_triplets(batch, tokenizer, query_max_length=32, doc_max_length=180):
 
 
 def train_epoch(model, dataloader, optimizer, device="cpu"):
-    """Train for one epoch using pairwise contrastive loss.
+    """Train for one epoch using pairwise contrastive loss + in-batch negatives.
 
-    For each query, we have a positive and negative document. Score both
-    and use margin ranking loss.
+    Training uses two losses:
+    1. Triplet margin loss: uses model.forward() (full scoring including all
+       components) so all parameters get gradients.
+    2. In-batch negative cross-entropy: uses CQI-weighted MaxSim for clean
+       encoder gradients. The scoring innovations (ASC, MGS, TIR) get their
+       gradients from the triplet loss, while the encoder gets strong gradients
+       from both losses.
     """
     model.train()
     total_loss = 0
@@ -61,43 +66,39 @@ def train_epoch(model, dataloader, optimizer, device="cpu"):
         n_ids = n_tok["input_ids"].to(device)
         n_mask = n_tok["attention_mask"].to(device)
 
+        # Full model forward pass: all components get gradients
         pos_scores = model(q_ids, q_mask, p_ids, p_mask)
         neg_scores = model(q_ids, q_mask, n_ids, n_mask)
 
         # Pairwise margin ranking loss
         loss = F.relu(1.0 - pos_scores + neg_scores).mean()
 
-        # Also add in-batch negatives: each positive doc is a negative for
-        # other queries in the batch
+        # In-batch negatives: CQI-weighted MaxSim for clean encoder gradients
         batch_size = q_ids.shape[0]
         if batch_size > 1:
-            # Encode all queries and positive docs
             q_embs, q_masks = model.encoder(q_ids, q_mask)
             d_embs, d_masks = model.encoder(p_ids, p_mask)
 
-            # Compute all-pairs scores
+            # CQI importance if available
+            if hasattr(model, "cqi") and model.cqi is not None:
+                importances = model.cqi(q_embs, q_masks)
+            else:
+                importances = q_masks.float()
+
             all_scores = []
             for i in range(batch_size):
                 row_scores = []
                 for j in range(batch_size):
-                    if hasattr(model, "cqi") and model.cqi is not None:
-                        importance = model.cqi(
-                            q_embs[i].unsqueeze(0), q_masks[i].unsqueeze(0)
-                        ).squeeze(0)
-                        from ..scoring.fluke_scoring import importance_weighted_maxsim
-                        ws, pts = importance_weighted_maxsim(
-                            q_embs[i], d_embs[j], importance,
-                            q_masks[i], d_masks[j],
-                        )
-                        s = ws.sum()
-                    else:
-                        from ..scoring.maxsim import maxsim
-                        s = maxsim(q_embs[i], d_embs[j], q_masks[i], d_masks[j])
-                    row_scores.append(s)
+                    # CQI-weighted MaxSim (fast, clean gradients for encoder+CQI)
+                    from ..scoring.fluke_scoring import importance_weighted_maxsim
+                    ws, _ = importance_weighted_maxsim(
+                        q_embs[i], d_embs[j], importances[i],
+                        q_masks[i], d_masks[j],
+                    )
+                    row_scores.append(ws.sum())
                 all_scores.append(torch.stack(row_scores))
-            score_matrix = torch.stack(all_scores)  # (batch, batch)
+            score_matrix = torch.stack(all_scores)
 
-            # Cross-entropy loss: diagonal should be highest
             labels = torch.arange(batch_size, device=device)
             ib_loss = F.cross_entropy(score_matrix, labels)
             loss = loss + ib_loss
@@ -136,7 +137,7 @@ def train_model(
         ),
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
     model.to(device)
     for epoch in range(num_epochs):
