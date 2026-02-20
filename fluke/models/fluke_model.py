@@ -128,6 +128,12 @@ class FLUKEModel(nn.Module):
         self.use_cqi = use_cqi
         self.use_soft_topk = use_soft_topk
 
+        # Adaptive topk: k = max(3, min(round(nq * topk_ratio), topk_cap))
+        # min_k=3 ensures we never go below original working value
+        self.topk_ratio = 0.3
+        self.topk_cap = 6
+        self.topk_min = 3
+
         # Innovation 1: Contextual Query Importance
         if use_cqi:
             self.cqi = ContextualQueryImportance(embedding_dim)
@@ -195,6 +201,14 @@ class FLUKEModel(nn.Module):
                 all_results.append((embs[j][mask].cpu(), mask[mask].cpu()))
         return all_results
 
+    def _adaptive_topk(self, query_embs, query_mask=None):
+        """Compute adaptive top-k based on actual query length."""
+        if query_mask is not None:
+            nq = int(query_mask.float().sum().item())
+        else:
+            nq = query_embs.shape[0]
+        return max(self.topk_min, min(round(nq * self.topk_ratio), self.topk_cap))
+
     def score(
         self,
         query_embs: torch.Tensor,
@@ -204,7 +218,7 @@ class FLUKEModel(nn.Module):
         doc_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Score a single query-document pair using FLUKE scoring."""
-        topk = self.topk if self.use_soft_topk else None
+        topk = self._adaptive_topk(query_embs, query_mask) if self.use_soft_topk else None
         return fluke_score(
             query_embs, doc_embs, importance_weights,
             tir_module=self.tir,
@@ -244,12 +258,12 @@ class FLUKEModel(nn.Module):
 
         scores = []
         for i in range(q_embs.shape[0]):
+            topk = self._adaptive_topk(q_embs[i], q_mask[i]) if self.use_soft_topk else None
             s = fluke_score(
                 q_embs[i], d_embs[i], importance[i],
                 tir_module=self.tir,
                 query_mask=q_mask[i], doc_mask=d_mask[i],
-                topk=self.topk if self.use_soft_topk else None,
-                temperature=self.temperature,
+                topk=topk, temperature=self.temperature,
                 max_query_tokens=self.query_max_length,
             )
             scores.append(s)

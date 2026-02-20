@@ -74,6 +74,9 @@ class FLUKEPlusModel(nn.Module):
         self.use_tir = use_tir
         self.use_mgs = use_mgs
         self.use_asc = use_asc
+        self.topk_ratio = 0.3
+        self.topk_cap = 6
+        self.topk_min = 3
 
         # CQI: Contextual Query Importance
         if use_cqi:
@@ -130,6 +133,14 @@ class FLUKEPlusModel(nn.Module):
         )
         return weighted_scores.sum(), per_token_scores
 
+    def _adaptive_topk(self, query_embs, query_mask=None):
+        """Compute adaptive top-k based on actual query length."""
+        if query_mask is not None:
+            nq = int(query_mask.float().sum().item())
+        else:
+            nq = query_embs.shape[0]
+        return max(self.topk_min, min(round(nq * self.topk_ratio), self.topk_cap))
+
     def score(
         self,
         query_embs: torch.Tensor,
@@ -143,8 +154,9 @@ class FLUKEPlusModel(nn.Module):
         Architecture (designed for same-scale-as-ColBERTv2):
         1. ASC produces calibrated per-token scores (starts == MaxSim via zero-init)
         2. CQI importance weights are applied to calibrated scores
-        3. MGS adds a small learned n-gram correction (bigram + trigram only)
-        4. TIR adds a gated residual for cross-term dependencies
+        3. Adaptive SoftTopK aggregation (k scales with query length)
+        4. MGS adds a small learned n-gram correction (bigram + trigram only)
+        5. TIR adds a gated residual for cross-term dependencies
         """
         # Step 1: Get per-token scores
         if self.asc is not None:
@@ -166,15 +178,15 @@ class FLUKEPlusModel(nn.Module):
         # Step 2: Apply CQI importance weighting
         weighted_scores = per_token_scores * importance_weights
 
-        # Step 3: Aggregate (SoftTopK or sum)
+        # Step 3: Aggregate (adaptive SoftTopK or sum)
         if self.use_soft_topk:
-            # Sort descending and take soft top-k
+            adaptive_k = self._adaptive_topk(query_embs, query_mask)
             nq = weighted_scores.shape[0]
-            if nq > self.topk:
-                topk_vals, _ = weighted_scores.topk(self.topk)
+            if nq > adaptive_k:
+                topk_vals, _ = weighted_scores.topk(adaptive_k)
                 weights = torch.softmax(topk_vals / self.temperature, dim=0)
-                # Scale by nq/topk so total score is comparable to full sum
-                total_score = (weights * topk_vals).sum() * (nq / self.topk)
+                # Scale by nq/k so total score is comparable to full sum
+                total_score = (weights * topk_vals).sum() * (nq / adaptive_k)
             else:
                 total_score = weighted_scores.sum()
         else:

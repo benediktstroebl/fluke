@@ -57,7 +57,7 @@ from fluke.models.fluke_model import FLUKEModel
 from fluke.models.fluke_plus import FLUKEPlusModel
 from fluke.indexing.indexer import TokenEmbeddingIndex
 from fluke.indexing.searcher import LatentSearcher
-from fluke.training.trainer import train_model
+from fluke.training.trainer import train_model, train_model_two_stage
 
 
 def set_seed(seed=42):
@@ -475,7 +475,7 @@ def generate_lotte_style_dataset(domain_name="science", seed=42):
 
     vocab = domain_vocabs.get(domain_name, domain_vocabs["science"])
 
-    n_topics = 15
+    n_topics = 25
     corpus = {}
     doc_topics = {}
     doc_counter = 0
@@ -489,7 +489,7 @@ def generate_lotte_style_dataset(domain_name="science", seed=42):
         topic_vocabs.append(topic_words + compounds)
 
     for topic_id in range(n_topics):
-        for _ in range(20):
+        for _ in range(25):
             doc_id = f"lotte_{domain_name}_{doc_counter}"
             words = []
             for _ in range(40):
@@ -504,7 +504,7 @@ def generate_lotte_style_dataset(domain_name="science", seed=42):
             doc_counter += 1
 
     # Noise docs
-    for _ in range(100):
+    for _ in range(150):
         doc_id = f"lotte_{domain_name}_{doc_counter}"
         words = [rng.choice(vocab + common_words) for _ in range(40)]
         corpus[doc_id] = " ".join(words)
@@ -514,7 +514,7 @@ def generate_lotte_style_dataset(domain_name="science", seed=42):
     # Long-tail queries (longer than standard BEIR)
     queries = {}
     qrels = defaultdict(dict)
-    for q_idx in range(40):
+    for q_idx in range(75):
         topic_id = q_idx % n_topics
         qid = f"lotte_q_{domain_name}_{q_idx}"
         n_qwords = rng.randint(5, 10)
@@ -526,7 +526,7 @@ def generate_lotte_style_dataset(domain_name="science", seed=42):
             if doc_topic == topic_id:
                 qrels[qid][doc_id] = 1
 
-    # Training triplets
+    # Training triplets (with hard negatives, matching BEIR quality)
     triplets = []
     doc_ids_by_topic = defaultdict(list)
     for doc_id, topic_id in doc_topics.items():
@@ -538,11 +538,18 @@ def generate_lotte_style_dataset(domain_name="science", seed=42):
         pos_docs = doc_ids_by_topic[topic_id]
         if not pos_docs:
             continue
-        for _ in range(3):
+        for _ in range(5):
             pos_doc_id = rng.choice(pos_docs)
-            neg_doc_id = rng.choice(all_doc_ids)
-            while doc_topics.get(neg_doc_id) == topic_id:
+            # Mix of random negatives and hard negatives (from different topics)
+            if rng.random() < 0.4:
+                other_topics = [t for t in range(n_topics) if t != topic_id]
+                neg_topic = rng.choice(other_topics)
+                neg_docs = doc_ids_by_topic[neg_topic]
+                neg_doc_id = rng.choice(neg_docs) if neg_docs else rng.choice(all_doc_ids)
+            else:
                 neg_doc_id = rng.choice(all_doc_ids)
+                while doc_topics.get(neg_doc_id) == topic_id:
+                    neg_doc_id = rng.choice(all_doc_ids)
             triplets.append((query_text, corpus[pos_doc_id], corpus[neg_doc_id]))
     rng.shuffle(triplets)
 
@@ -653,8 +660,18 @@ def run_e2e_experiment(num_epochs=6, train_batch_size=16, lr=5e-5):
             )
 
         model = config["class"](**kwargs)
-        train_model(model, train_triplets, num_epochs=num_epochs,
-                     batch_size=train_batch_size, lr=lr)
+
+        if config["class"] == FLUKEPlusModel:
+            # Two-stage training: encoder first, then scoring components
+            train_model_two_stage(
+                model, train_triplets,
+                stage1_epochs=num_epochs, stage2_epochs=num_epochs // 2,
+                batch_size=train_batch_size,
+                stage1_lr=lr, stage2_lr=lr / 5,
+            )
+        else:
+            train_model(model, train_triplets, num_epochs=num_epochs,
+                         batch_size=train_batch_size, lr=lr)
 
         print(f"  Evaluating {model_name}...")
         metrics = evaluate_retrieval(model, corpus, queries, qrels, config["type"])
@@ -677,7 +694,7 @@ def run_e2e_experiment(num_epochs=6, train_batch_size=16, lr=5e-5):
         corpus, queries, qrels, triplets = generate_lotte_style_dataset(
             domain_name=domain, seed=42,
         )
-        train_triplets = triplets[:min(len(triplets), 2000)]
+        train_triplets = triplets[:min(len(triplets), 3000)]
 
         domain_results = {}
         for model_name, config in model_configs.items():
@@ -695,8 +712,17 @@ def run_e2e_experiment(num_epochs=6, train_batch_size=16, lr=5e-5):
                 )
 
             model = config["class"](**kwargs)
-            train_model(model, train_triplets, num_epochs=num_epochs,
-                         batch_size=train_batch_size, lr=lr)
+
+            if config["class"] == FLUKEPlusModel:
+                train_model_two_stage(
+                    model, train_triplets,
+                    stage1_epochs=num_epochs, stage2_epochs=num_epochs // 2,
+                    batch_size=train_batch_size,
+                    stage1_lr=lr, stage2_lr=lr / 5,
+                )
+            else:
+                train_model(model, train_triplets, num_epochs=num_epochs,
+                             batch_size=train_batch_size, lr=lr)
 
             metrics = evaluate_retrieval(model, corpus, queries, qrels, config["type"])
             domain_results[model_name] = metrics
@@ -800,8 +826,16 @@ def run_ablation_study(num_epochs=6, train_batch_size=16, lr=5e-5):
                 use_asc=config.get("use_asc", False),
             )
 
-        train_model(model, train_triplets, num_epochs=num_epochs,
-                     batch_size=train_batch_size, lr=lr)
+        if config["cls"] == "fluke_plus":
+            train_model_two_stage(
+                model, train_triplets,
+                stage1_epochs=num_epochs, stage2_epochs=num_epochs // 2,
+                batch_size=train_batch_size,
+                stage1_lr=lr, stage2_lr=lr / 5,
+            )
+        else:
+            train_model(model, train_triplets, num_epochs=num_epochs,
+                         batch_size=train_batch_size, lr=lr)
         metrics = evaluate_retrieval(model, corpus, queries, qrels, config["type"])
         print(f"  {name}: nDCG@10={metrics['nDCG@10']:.4f}, "
               f"Recall@100={metrics['Recall@100']:.4f}")

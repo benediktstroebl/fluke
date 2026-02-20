@@ -114,19 +114,11 @@ def train_epoch(model, dataloader, optimizer, device="cpu"):
     return total_loss / max(num_batches, 1)
 
 
-def train_model(
-    model,
-    triplets: list[tuple[str, str, str]],
-    num_epochs: int = 3,
-    batch_size: int = 16,
-    lr: float = 3e-6,
-    device: str = "cpu",
-):
-    """Full training loop."""
+def _make_dataloader(model, triplets, batch_size):
+    """Create a DataLoader from triplets using the model's tokenizer."""
     dataset = TripletDataset(triplets)
     tokenizer = model.encoder.tokenizer
-
-    dataloader = DataLoader(
+    return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
@@ -137,11 +129,85 @@ def train_model(
         ),
     )
 
+
+def train_model(
+    model,
+    triplets: list[tuple[str, str, str]],
+    num_epochs: int = 3,
+    batch_size: int = 16,
+    lr: float = 3e-6,
+    device: str = "cpu",
+):
+    """Full training loop."""
+    dataloader = _make_dataloader(model, triplets, batch_size)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
     model.to(device)
     for epoch in range(num_epochs):
         avg_loss = train_epoch(model, dataloader, optimizer, device)
         print(f"Epoch {epoch + 1}/{num_epochs} — Loss: {avg_loss:.4f}")
+
+    return model
+
+
+def train_model_two_stage(
+    model,
+    triplets: list[tuple[str, str, str]],
+    stage1_epochs: int = 4,
+    stage2_epochs: int = 4,
+    batch_size: int = 16,
+    stage1_lr: float = 5e-5,
+    stage2_lr: float = 1e-5,
+    device: str = "cpu",
+):
+    """Two-stage training for FLUKE+ (and models with many scoring components).
+
+    Stage 1: Freeze scoring components (CQI, TIR, MGS, ASC), train only the
+        encoder. The zero-initialized scoring components make the model behave
+        like ColBERTv2, giving the encoder a clean learning signal.
+
+    Stage 2: Unfreeze everything and fine-tune at lower LR. The encoder is
+        already well-trained, so the scoring components can learn meaningful
+        corrections on top of good representations.
+
+    This avoids the optimization difficulty of jointly training 5+ components
+    from scratch, which causes slow convergence for FLUKE+.
+    """
+    dataloader = _make_dataloader(model, triplets, batch_size)
+    model.to(device)
+
+    # Identify scoring component parameters
+    scoring_component_names = {'cqi', 'tir', 'mgs', 'asc', 'tir_gate', 'ngram_scale'}
+
+    def _is_scoring_param(name):
+        return any(comp in name.split('.') or name.startswith(comp + '.')
+                    or name == comp for comp in scoring_component_names)
+
+    # Stage 1: Freeze scoring components
+    frozen_params = []
+    for name, param in model.named_parameters():
+        if _is_scoring_param(name):
+            param.requires_grad = False
+            frozen_params.append(name)
+
+    encoder_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer1 = torch.optim.AdamW(encoder_params, lr=stage1_lr, weight_decay=0.01)
+
+    print(f"  Stage 1: Training encoder ({len(encoder_params)} param groups, "
+          f"{len(frozen_params)} frozen)")
+    for epoch in range(stage1_epochs):
+        avg_loss = train_epoch(model, dataloader, optimizer1, device)
+        print(f"    Stage 1 Epoch {epoch + 1}/{stage1_epochs} — Loss: {avg_loss:.4f}")
+
+    # Stage 2: Unfreeze all, lower LR
+    for name, param in model.named_parameters():
+        param.requires_grad = True
+
+    optimizer2 = torch.optim.AdamW(model.parameters(), lr=stage2_lr, weight_decay=0.01)
+
+    print(f"  Stage 2: Fine-tuning all components (lr={stage2_lr})")
+    for epoch in range(stage2_epochs):
+        avg_loss = train_epoch(model, dataloader, optimizer2, device)
+        print(f"    Stage 2 Epoch {epoch + 1}/{stage2_epochs} — Loss: {avg_loss:.4f}")
 
     return model
