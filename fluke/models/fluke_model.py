@@ -112,7 +112,7 @@ class FLUKEModel(nn.Module):
         query_max_length: int = 32,
         doc_max_length: int = 180,
         topk: int = 3,
-        temperature: float = 0.1,
+        temperature: float = 0.5,
         use_tir: bool = True,
         use_cqi: bool = True,
         use_soft_topk: bool = True,
