@@ -116,6 +116,8 @@ class FLUKEModel(nn.Module):
         use_tir: bool = True,
         use_cqi: bool = True,
         use_soft_topk: bool = True,
+        disc_scale: float = 3.0,
+        disc_range: tuple[float, float] = (0.7, 1.3),
     ):
         super().__init__()
         self.encoder = TokenEncoder(model_name, embedding_dim)
@@ -127,6 +129,8 @@ class FLUKEModel(nn.Module):
         self.use_tir = use_tir
         self.use_cqi = use_cqi
         self.use_soft_topk = use_soft_topk
+        self.disc_scale = disc_scale
+        self.disc_range = disc_range
 
         # Adaptive topk: k = max(3, min(round(nq * topk_ratio), topk_cap))
         # min_k=3 ensures we never go below original working value
@@ -143,7 +147,8 @@ class FLUKEModel(nn.Module):
         # Innovation 3: Token Interaction Residual
         if use_tir:
             self.tir = TokenInteractionResidual(
-                max_query_tokens=query_max_length, hidden_dim=64
+                max_query_tokens=query_max_length, hidden_dim=64,
+                use_score_stats=False,
             )
         else:
             self.tir = None
@@ -225,6 +230,7 @@ class FLUKEModel(nn.Module):
             query_mask=query_mask, doc_mask=doc_mask,
             topk=topk, temperature=self.temperature,
             max_query_tokens=self.query_max_length,
+            disc_scale=self.disc_scale, disc_range=self.disc_range,
         )
 
     def score_batch(
@@ -265,6 +271,7 @@ class FLUKEModel(nn.Module):
                 query_mask=q_mask[i], doc_mask=d_mask[i],
                 topk=topk, temperature=self.temperature,
                 max_query_tokens=self.query_max_length,
+                disc_scale=self.disc_scale, disc_range=self.disc_range,
             )
             scores.append(s)
         return torch.stack(scores)

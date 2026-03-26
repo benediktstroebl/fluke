@@ -127,7 +127,7 @@ class FLUKEPlusModel(nn.Module):
         from ..scoring.fluke_scoring import importance_weighted_maxsim
 
         topk = self.topk if self.use_soft_topk else None
-        weighted_scores, per_token_scores = importance_weighted_maxsim(
+        weighted_scores, per_token_scores, _, _ = importance_weighted_maxsim(
             query_embs, doc_embs, importance_weights,
             query_mask, doc_mask, topk=topk, temperature=self.temperature,
         )

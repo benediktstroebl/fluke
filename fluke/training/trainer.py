@@ -43,7 +43,7 @@ def collate_triplets(batch, tokenizer, query_max_length=32, doc_max_length=180):
     return q_tok, p_tok, n_tok
 
 
-def train_epoch(model, dataloader, optimizer, device="cpu"):
+def train_epoch(model, dataloader, optimizer, device="cpu", scheduler=None):
     """Train for one epoch using pairwise contrastive loss + in-batch negatives.
 
     Training uses two losses:
@@ -91,7 +91,7 @@ def train_epoch(model, dataloader, optimizer, device="cpu"):
                 for j in range(batch_size):
                     # CQI-weighted MaxSim (fast, clean gradients for encoder+CQI)
                     from ..scoring.fluke_scoring import importance_weighted_maxsim
-                    ws, _ = importance_weighted_maxsim(
+                    ws, _, _, _ = importance_weighted_maxsim(
                         q_embs[i], d_embs[j], importances[i],
                         q_masks[i], d_masks[j],
                     )
@@ -107,6 +107,8 @@ def train_epoch(model, dataloader, optimizer, device="cpu"):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         total_loss += loss.item()
         num_batches += 1
@@ -130,6 +132,22 @@ def _make_dataloader(model, triplets, batch_size):
     )
 
 
+def _get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps):
+    """Cosine LR schedule with linear warmup."""
+    from torch.optim.lr_scheduler import LambdaLR
+    import math
+
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(
+            max(1, num_training_steps - num_warmup_steps)
+        )
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    return LambdaLR(optimizer, lr_lambda)
+
+
 def train_model(
     model,
     triplets: list[tuple[str, str, str]],
@@ -137,14 +155,22 @@ def train_model(
     batch_size: int = 16,
     lr: float = 3e-6,
     device: str = "cpu",
+    use_lr_schedule: bool = False,
+    warmup_fraction: float = 0.1,
 ):
-    """Full training loop."""
+    """Full training loop with optional cosine LR schedule."""
     dataloader = _make_dataloader(model, triplets, batch_size)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
+    scheduler = None
+    if use_lr_schedule:
+        total_steps = len(dataloader) * num_epochs
+        warmup_steps = int(total_steps * warmup_fraction)
+        scheduler = _get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+
     model.to(device)
     for epoch in range(num_epochs):
-        avg_loss = train_epoch(model, dataloader, optimizer, device)
+        avg_loss = train_epoch(model, dataloader, optimizer, device, scheduler=scheduler)
         print(f"Epoch {epoch + 1}/{num_epochs} — Loss: {avg_loss:.4f}")
 
     return model

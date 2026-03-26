@@ -24,6 +24,12 @@ class LatentSearcher:
         tir_module: TokenInteractionResidual | None = None,
         max_query_tokens: int = 32,
         fluke_plus_model=None,
+        use_adaptive_topk: bool = False,
+        topk_ratio: float = 0.3,
+        topk_cap: int = 6,
+        topk_min: int = 3,
+        disc_scale: float = 3.0,
+        disc_range: tuple[float, float] = (0.7, 1.3),
     ):
         self.index = index
         self.scoring = scoring
@@ -32,6 +38,17 @@ class LatentSearcher:
         self.tir_module = tir_module
         self.max_query_tokens = max_query_tokens
         self.fluke_plus_model = fluke_plus_model
+        self.use_adaptive_topk = use_adaptive_topk
+        self.topk_ratio = topk_ratio
+        self.topk_cap = topk_cap
+        self.topk_min = topk_min
+        self.disc_scale = disc_scale
+        self.disc_range = disc_range
+
+    def _get_adaptive_topk(self, query_embs: torch.Tensor) -> int:
+        """Compute adaptive top-k based on query length."""
+        nq = query_embs.shape[0]
+        return max(self.topk_min, min(round(nq * self.topk_ratio), self.topk_cap))
 
     def search(
         self,
@@ -62,13 +79,16 @@ class LatentSearcher:
                     query_embs, doc_embs, iw, query_mask=query_mask,
                 )
             elif self.scoring == "fluke" and importance_weights is not None:
+                topk = self._get_adaptive_topk(query_embs) if self.use_adaptive_topk else self.topk_param
                 score = fluke_score(
                     query_embs, doc_embs, importance_weights,
                     tir_module=self.tir_module,
                     query_mask=query_mask,
-                    topk=self.topk_param,
+                    topk=topk,
                     temperature=self.temperature,
                     max_query_tokens=self.max_query_tokens,
+                    disc_scale=self.disc_scale,
+                    disc_range=self.disc_range,
                 )
             else:
                 score = maxsim(query_embs, doc_embs, query_mask)

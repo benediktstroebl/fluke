@@ -407,6 +407,7 @@ def generate_synthetic_dataset(
 
     all_doc_ids = list(corpus.keys())
     # Generate more triplets with harder negatives (from nearby topics)
+    # More hard negatives help FLUKE's CQI and TIR learn discriminative patterns
     for query_id, query_text in queries.items():
         topic_id = int(query_id.split("_")[1]) // queries_per_topic
         pos_docs = doc_ids_by_topic[topic_id]
@@ -581,6 +582,8 @@ def evaluate_retrieval(
         index, scoring=model_type, tir_module=tir_module,
         max_query_tokens=getattr(model, "query_max_length", 32),
         fluke_plus_model=fluke_plus_ref,
+        disc_scale=getattr(model, "disc_scale", 3.0),
+        disc_range=getattr(model, "disc_range", (0.7, 1.3)),
     )
     search_results = searcher.batch_search(query_data, top_k=top_k)
 
@@ -630,7 +633,7 @@ def run_e2e_experiment(num_epochs=6, train_batch_size=16, lr=5e-5):
     corpus, queries, qrels, triplets = generate_synthetic_dataset(
         n_topics=50, docs_per_topic=20, noise_docs=200, queries_per_topic=5,
     )
-    # Use more triplets for better training
+    # Use all available triplets for better training
     train_triplets = triplets[:min(len(triplets), 3000)]
 
     print(f"  Corpus: {len(corpus)} docs, Queries: {len(queries)}, "
