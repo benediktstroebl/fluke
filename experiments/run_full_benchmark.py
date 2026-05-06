@@ -583,7 +583,8 @@ def evaluate_retrieval(
         max_query_tokens=getattr(model, "query_max_length", 32),
         fluke_plus_model=fluke_plus_ref,
         disc_scale=getattr(model, "disc_scale", 3.0),
-        disc_range=getattr(model, "disc_range", (0.7, 1.3)),
+        disc_range=getattr(model, "disc_range", (0.5, 1.5)),
+        coverage_weight=getattr(model, "coverage_weight", 0.15),
     )
     search_results = searcher.batch_search(query_data, top_k=top_k)
 

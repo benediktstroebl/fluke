@@ -29,7 +29,8 @@ class LatentSearcher:
         topk_cap: int = 6,
         topk_min: int = 3,
         disc_scale: float = 3.0,
-        disc_range: tuple[float, float] = (0.7, 1.3),
+        disc_range: tuple[float, float] = (0.5, 1.5),
+        coverage_weight: float = 0.15,
     ):
         self.index = index
         self.scoring = scoring
@@ -44,6 +45,7 @@ class LatentSearcher:
         self.topk_min = topk_min
         self.disc_scale = disc_scale
         self.disc_range = disc_range
+        self.coverage_weight = coverage_weight
 
     def _get_adaptive_topk(self, query_embs: torch.Tensor) -> int:
         """Compute adaptive top-k based on query length."""
@@ -89,6 +91,7 @@ class LatentSearcher:
                     max_query_tokens=self.max_query_tokens,
                     disc_scale=self.disc_scale,
                     disc_range=self.disc_range,
+                    coverage_weight=self.coverage_weight,
                 )
             else:
                 score = maxsim(query_embs, doc_embs, query_mask)

@@ -117,7 +117,8 @@ class FLUKEModel(nn.Module):
         use_cqi: bool = True,
         use_soft_topk: bool = True,
         disc_scale: float = 3.0,
-        disc_range: tuple[float, float] = (0.7, 1.3),
+        disc_range: tuple[float, float] = (0.5, 1.5),
+        coverage_weight: float = 0.15,
     ):
         super().__init__()
         self.encoder = TokenEncoder(model_name, embedding_dim)
@@ -131,6 +132,7 @@ class FLUKEModel(nn.Module):
         self.use_soft_topk = use_soft_topk
         self.disc_scale = disc_scale
         self.disc_range = disc_range
+        self.coverage_weight = coverage_weight
 
         # Adaptive topk: k = max(3, min(round(nq * topk_ratio), topk_cap))
         # min_k=3 ensures we never go below original working value
@@ -231,6 +233,7 @@ class FLUKEModel(nn.Module):
             topk=topk, temperature=self.temperature,
             max_query_tokens=self.query_max_length,
             disc_scale=self.disc_scale, disc_range=self.disc_range,
+            coverage_weight=self.coverage_weight,
         )
 
     def score_batch(
@@ -272,6 +275,7 @@ class FLUKEModel(nn.Module):
                 topk=topk, temperature=self.temperature,
                 max_query_tokens=self.query_max_length,
                 disc_scale=self.disc_scale, disc_range=self.disc_range,
+                coverage_weight=self.coverage_weight,
             )
             scores.append(s)
         return torch.stack(scores)

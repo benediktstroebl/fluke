@@ -184,7 +184,8 @@ def fluke_score(
     temperature: float = 0.1,
     max_query_tokens: int = 32,
     disc_scale: float = 3.0,
-    disc_range: tuple[float, float] = (0.7, 1.3),
+    disc_range: tuple[float, float] = (0.5, 1.5),
+    coverage_weight: float = 0.15,
 ) -> torch.Tensor:
     """Complete FLUKE scoring function.
 
@@ -204,6 +205,7 @@ def fluke_score(
         max_query_tokens: padding size for TIR input
         disc_scale: sigmoid scale for discriminativeness reweighting
         disc_range: (lo, hi) bounds for discriminativeness weights
+        coverage_weight: strength of coverage bonus (0 = disabled)
 
     Returns:
         Scalar relevance score.
@@ -229,12 +231,27 @@ def fluke_score(
         sim_matrix_disc.masked_fill(~doc_mask.unsqueeze(0), float("-inf")).max(dim=-1).values
     # Peak above mean: how much the best match stands out
     peak_above_mean = (max_disc - mean_disc).clamp(min=0)
-    # Soft discriminativeness weight: sigmoid-based, bounded by disc_range
-    lo, hi = disc_range
-    disc_weight = lo + (hi - lo) * torch.sigmoid(disc_scale * (peak_above_mean - peak_above_mean.mean()))
-    weighted_scores = weighted_scores * disc_weight.detach()
+    # Additive discriminativeness bonus: reward documents where query tokens
+    # find specific, distinctive matches (high peak_above_mean). Unlike
+    # multiplicative reweighting, this never penalizes any tokens —
+    # it only adds a bonus proportional to match specificity.
+    nq_active = int(query_mask.float().sum().item()) if query_mask is not None else query_embeddings.shape[0]
+    disc_bonus = peak_above_mean.sum() / max(nq_active, 1) * disc_scale
 
-    base_score = weighted_scores.sum()
+    # Coverage scoring: reward documents where all query tokens match well.
+    # Computes min/mean ratio of per-token scores — high coverage means even
+    # the worst-matching token is close to the average (all concepts present).
+    # Critical for domain-specific queries (LoTTE) where every term matters.
+    coverage_bonus = torch.tensor(0.0, device=weighted_scores.device)
+    if coverage_weight > 0:
+        active = weighted_scores[query_mask] if query_mask is not None else weighted_scores
+        if active.numel() > 1:
+            min_s = active.min()
+            mean_s = active.mean().clamp(min=1e-6)
+            coverage = (min_s / mean_s).clamp(0, 1)
+            coverage_bonus = coverage_weight * coverage * active.sum()
+
+    base_score = weighted_scores.sum() + disc_bonus.detach() + coverage_bonus.detach()
 
     if tir_module is not None:
         # Pad per_token_scores to fixed size for TIR
