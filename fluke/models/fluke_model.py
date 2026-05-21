@@ -112,10 +112,13 @@ class FLUKEModel(nn.Module):
         query_max_length: int = 32,
         doc_max_length: int = 180,
         topk: int = 3,
-        temperature: float = 0.1,
+        temperature: float = 0.5,
         use_tir: bool = True,
         use_cqi: bool = True,
         use_soft_topk: bool = True,
+        disc_scale: float = 0.0,
+        disc_range: tuple[float, float] = (0.5, 1.5),
+        coverage_weight: float = 0.0,
     ):
         super().__init__()
         self.encoder = TokenEncoder(model_name, embedding_dim)
@@ -127,6 +130,15 @@ class FLUKEModel(nn.Module):
         self.use_tir = use_tir
         self.use_cqi = use_cqi
         self.use_soft_topk = use_soft_topk
+        self.disc_scale = disc_scale
+        self.disc_range = disc_range
+        self.coverage_weight = coverage_weight
+
+        # Adaptive topk: k = max(3, min(round(nq * topk_ratio), topk_cap))
+        # min_k=3 ensures we never go below original working value
+        self.topk_ratio = 0.3
+        self.topk_cap = 6
+        self.topk_min = 3
 
         # Innovation 1: Contextual Query Importance
         if use_cqi:
@@ -137,7 +149,8 @@ class FLUKEModel(nn.Module):
         # Innovation 3: Token Interaction Residual
         if use_tir:
             self.tir = TokenInteractionResidual(
-                max_query_tokens=query_max_length, hidden_dim=64
+                max_query_tokens=query_max_length, hidden_dim=64,
+                use_score_stats=False,
             )
         else:
             self.tir = None
@@ -195,6 +208,14 @@ class FLUKEModel(nn.Module):
                 all_results.append((embs[j][mask].cpu(), mask[mask].cpu()))
         return all_results
 
+    def _adaptive_topk(self, query_embs, query_mask=None):
+        """Compute adaptive top-k based on actual query length."""
+        if query_mask is not None:
+            nq = int(query_mask.float().sum().item())
+        else:
+            nq = query_embs.shape[0]
+        return max(self.topk_min, min(round(nq * self.topk_ratio), self.topk_cap))
+
     def score(
         self,
         query_embs: torch.Tensor,
@@ -204,13 +225,15 @@ class FLUKEModel(nn.Module):
         doc_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Score a single query-document pair using FLUKE scoring."""
-        topk = self.topk if self.use_soft_topk else None
+        topk = self._adaptive_topk(query_embs, query_mask) if self.use_soft_topk else None
         return fluke_score(
             query_embs, doc_embs, importance_weights,
             tir_module=self.tir,
             query_mask=query_mask, doc_mask=doc_mask,
             topk=topk, temperature=self.temperature,
             max_query_tokens=self.query_max_length,
+            disc_scale=self.disc_scale, disc_range=self.disc_range,
+            coverage_weight=self.coverage_weight,
         )
 
     def score_batch(
@@ -244,13 +267,15 @@ class FLUKEModel(nn.Module):
 
         scores = []
         for i in range(q_embs.shape[0]):
+            topk = self._adaptive_topk(q_embs[i], q_mask[i]) if self.use_soft_topk else None
             s = fluke_score(
                 q_embs[i], d_embs[i], importance[i],
                 tir_module=self.tir,
                 query_mask=q_mask[i], doc_mask=d_mask[i],
-                topk=self.topk if self.use_soft_topk else None,
-                temperature=self.temperature,
+                topk=topk, temperature=self.temperature,
                 max_query_tokens=self.query_max_length,
+                disc_scale=self.disc_scale, disc_range=self.disc_range,
+                coverage_weight=self.coverage_weight,
             )
             scores.append(s)
         return torch.stack(scores)

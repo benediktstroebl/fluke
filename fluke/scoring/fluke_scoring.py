@@ -57,7 +57,8 @@ def importance_weighted_maxsim(
     doc_mask: torch.Tensor | None = None,
     topk: int | None = None,
     temperature: float = 0.1,
-) -> torch.Tensor:
+    compute_stats: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """MaxSim with per-query-token importance weighting.
 
     Args:
@@ -68,20 +69,23 @@ def importance_weighted_maxsim(
         doc_mask: (num_doc_tokens,) boolean mask
         topk: if set, use soft top-K instead of hard max
         temperature: softmax temperature for soft top-K
+        compute_stats: if True, compute per-token mean/std similarity stats
 
     Returns:
-        Scalar relevance score.
+        weighted_scores, per_token_scores, per_token_mean (or None), per_token_std (or None)
     """
+    per_token_mean = None
+    per_token_std = None
+
     if topk is not None:
-        # Use soft top-K aggregation
-        scores = []
-        for i in range(query_embeddings.shape[0]):
-            s = soft_topk_sim(
-                query_embeddings[i], doc_embeddings, k=topk,
-                temperature=temperature, doc_mask=doc_mask,
-            )
-            scores.append(s)
-        per_token_scores = torch.stack(scores)
+        # Vectorized soft top-K aggregation
+        sim_matrix = query_embeddings @ doc_embeddings.T  # (nq, nd)
+        if doc_mask is not None:
+            sim_matrix = sim_matrix.masked_fill(~doc_mask.unsqueeze(0), float("-inf"))
+        actual_k = min(topk, sim_matrix.shape[1])
+        topk_sims, _ = sim_matrix.topk(actual_k, dim=-1)  # (nq, k)
+        weights = F.softmax(topk_sims / temperature, dim=-1)  # (nq, k)
+        per_token_scores = (weights * topk_sims).sum(dim=-1)  # (nq,)
     else:
         # Standard hard MaxSim
         sim_matrix = query_embeddings @ doc_embeddings.T
@@ -89,32 +93,52 @@ def importance_weighted_maxsim(
             sim_matrix = sim_matrix.masked_fill(~doc_mask.unsqueeze(0), float("-inf"))
         per_token_scores = sim_matrix.max(dim=-1).values
 
+    # Optionally compute per-token distribution stats (for enhanced TIR)
+    if compute_stats:
+        with torch.no_grad():
+            sim_matrix_full = query_embeddings @ doc_embeddings.T
+            if doc_mask is not None:
+                valid_sims = sim_matrix_full.masked_fill(~doc_mask.unsqueeze(0), 0.0)
+                n_valid = doc_mask.float().sum().clamp(min=1)
+                per_token_mean = valid_sims.sum(dim=-1) / n_valid
+                per_token_var = ((valid_sims - per_token_mean.unsqueeze(-1)) ** 2 * doc_mask.float().unsqueeze(0)).sum(dim=-1) / n_valid
+            else:
+                per_token_mean = sim_matrix_full.mean(dim=-1)
+                per_token_var = sim_matrix_full.var(dim=-1, correction=0)
+            per_token_std = per_token_var.sqrt()
+
     # Apply importance weights
     weighted_scores = per_token_scores * importance_weights
 
     if query_mask is not None:
         weighted_scores = weighted_scores * query_mask.float()
 
-    return weighted_scores, per_token_scores
+    return weighted_scores, per_token_scores, per_token_mean, per_token_std
 
 
 class TokenInteractionResidual(nn.Module):
     """Lightweight MLP that captures cross-term dependencies.
 
-    Takes the vector of per-query-token MaxSim scores and outputs a scalar
-    residual correction. This allows the model to learn patterns like:
+    Takes the vector of per-query-token MaxSim scores (and optionally
+    mean/std similarity statistics) and outputs a scalar residual correction.
+    This allows the model to learn patterns like:
     - "Both terms A and B must match" (conjunction)
     - "Term A matching but B not matching is bad" (required terms)
+    - "This match is discriminative (high std)" vs "stopword match (low std)"
     - Non-linear score interactions
 
-    The MLP operates on |q|-dimensional input (typically 32), so it's
-    extremely lightweight and adds negligible compute.
+    The MLP operates on |q|-dimensional input (typically 32 or 96 with stats),
+    so it's extremely lightweight and adds negligible compute.
     """
 
-    def __init__(self, max_query_tokens: int = 32, hidden_dim: int = 64):
+    def __init__(self, max_query_tokens: int = 32, hidden_dim: int = 64,
+                 use_score_stats: bool = False):
         super().__init__()
+        self.use_score_stats = use_score_stats
+        # Input: max scores + optionally mean and std per token
+        input_dim = max_query_tokens * (3 if use_score_stats else 1)
         self.net = nn.Sequential(
-            nn.Linear(max_query_tokens, hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim),
@@ -128,17 +152,24 @@ class TokenInteractionResidual(nn.Module):
                 nn.init.xavier_uniform_(layer.weight, gain=0.01)
                 nn.init.zeros_(layer.bias)
 
-    def forward(self, per_token_scores: torch.Tensor) -> torch.Tensor:
+    def forward(self, per_token_scores: torch.Tensor,
+                per_token_mean: torch.Tensor | None = None,
+                per_token_std: torch.Tensor | None = None) -> torch.Tensor:
         """Compute interaction residual from per-token match scores.
 
         Args:
-            per_token_scores: (batch, max_query_tokens) per-token MaxSim scores,
-                padded to max_query_tokens.
+            per_token_scores: (batch, max_query_tokens) per-token MaxSim scores.
+            per_token_mean: (batch, max_query_tokens) mean similarity per token.
+            per_token_std: (batch, max_query_tokens) std similarity per token.
 
         Returns:
             (batch,) residual score corrections.
         """
-        return self.net(per_token_scores).squeeze(-1)
+        if self.use_score_stats and per_token_mean is not None and per_token_std is not None:
+            x = torch.cat([per_token_scores, per_token_mean, per_token_std], dim=-1)
+        else:
+            x = per_token_scores
+        return self.net(x).squeeze(-1)
 
 
 def fluke_score(
@@ -151,12 +182,15 @@ def fluke_score(
     topk: int = 3,
     temperature: float = 0.1,
     max_query_tokens: int = 32,
+    disc_scale: float = 0.0,
+    disc_range: tuple[float, float] = (0.5, 1.5),
+    coverage_weight: float = 0.0,
 ) -> torch.Tensor:
     """Complete FLUKE scoring function.
 
     Combines:
     1. Importance-weighted MaxSim (or soft top-K)
-    2. Token Interaction Residual
+    2. Token Interaction Residual (with optional score distribution stats)
 
     Args:
         query_embeddings: (num_query_tokens, dim)
@@ -168,27 +202,79 @@ def fluke_score(
         topk: K for soft top-K aggregation
         temperature: softmax temperature
         max_query_tokens: padding size for TIR input
+        disc_scale: sigmoid scale for discriminativeness reweighting
+        disc_range: (lo, hi) bounds for discriminativeness weights
+        coverage_weight: strength of coverage bonus (0 = disabled)
 
     Returns:
         Scalar relevance score.
     """
-    weighted_scores, per_token_scores = importance_weighted_maxsim(
+    need_stats = tir_module is not None and tir_module.use_score_stats
+    weighted_scores, per_token_scores, per_token_mean, per_token_std = importance_weighted_maxsim(
         query_embeddings, doc_embeddings, importance_weights,
         query_mask, doc_mask, topk=topk, temperature=temperature,
+        compute_stats=need_stats,
     )
 
-    base_score = weighted_scores.sum()
+    if disc_scale > 0:
+        sim_matrix_disc = query_embeddings @ doc_embeddings.T
+        if doc_mask is not None:
+            valid_sims_disc = sim_matrix_disc.masked_fill(~doc_mask.unsqueeze(0), 0.0)
+            n_valid_disc = doc_mask.float().sum().clamp(min=1)
+            mean_disc = valid_sims_disc.sum(dim=-1) / n_valid_disc
+        else:
+            mean_disc = sim_matrix_disc.mean(dim=-1)
+        max_disc = sim_matrix_disc.max(dim=-1).values if doc_mask is None else \
+            sim_matrix_disc.masked_fill(~doc_mask.unsqueeze(0), float("-inf")).max(dim=-1).values
+        peak_above_mean = (max_disc - mean_disc).clamp(min=0)
+        pam_std = peak_above_mean.std().clamp(min=1e-6)
+        effective_scale = (disc_scale * pam_std).detach()
+        disc_weights = (1.0 + effective_scale * peak_above_mean).detach()
+        disc_weighted = weighted_scores * disc_weights
+        if query_mask is not None:
+            disc_weighted = disc_weighted * query_mask.float()
+    else:
+        disc_weighted = weighted_scores
+
+    cov_factor = torch.tensor(1.0, device=weighted_scores.device)
+    if coverage_weight > 0:
+        active = disc_weighted[query_mask] if query_mask is not None else disc_weighted
+        if active.numel() > 1:
+            min_s = active.min()
+            mean_s = active.mean().clamp(min=1e-6)
+            coverage = (min_s / mean_s).clamp(0, 1)
+            cov_factor = (1.0 + coverage_weight * coverage).detach()
+
+    base_score = disc_weighted.sum() * cov_factor
 
     if tir_module is not None:
         # Pad per_token_scores to fixed size for TIR
         nq = per_token_scores.shape[0]
         padded = torch.zeros(max_query_tokens, device=per_token_scores.device)
         padded[:nq] = per_token_scores
+
+        # Pad mean and std if available and TIR uses them
+        padded_mean = None
+        padded_std = None
+        if tir_module.use_score_stats and per_token_mean is not None:
+            padded_mean = torch.zeros(max_query_tokens, device=per_token_scores.device)
+            padded_mean[:nq] = per_token_mean
+            padded_std = torch.zeros(max_query_tokens, device=per_token_scores.device)
+            padded_std[:nq] = per_token_std
+
         if query_mask is not None:
             mask_padded = torch.zeros(max_query_tokens, device=per_token_scores.device)
             mask_padded[:nq] = query_mask.float()
             padded = padded * mask_padded
-        residual = tir_module(padded.unsqueeze(0))
+            if padded_mean is not None:
+                padded_mean = padded_mean * mask_padded
+                padded_std = padded_std * mask_padded
+
+        residual = tir_module(
+            padded.unsqueeze(0),
+            padded_mean.unsqueeze(0) if padded_mean is not None else None,
+            padded_std.unsqueeze(0) if padded_std is not None else None,
+        )
         return base_score + residual.squeeze()
 
     return base_score

@@ -208,11 +208,13 @@ class BEIREvaluator:
 
         # Step 4: Search
         tir_module = getattr(model, "tir", None)
+        fluke_plus_ref = model if model_type == "fluke_plus" else None
         searcher = LatentSearcher(
             index,
             scoring=model_type,
             tir_module=tir_module,
             max_query_tokens=getattr(model, "query_max_length", 32),
+            fluke_plus_model=fluke_plus_ref,
         )
 
         print(f"Searching {len(query_ids)} queries...")

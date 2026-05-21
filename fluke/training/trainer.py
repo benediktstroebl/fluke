@@ -43,11 +43,16 @@ def collate_triplets(batch, tokenizer, query_max_length=32, doc_max_length=180):
     return q_tok, p_tok, n_tok
 
 
-def train_epoch(model, dataloader, optimizer, device="cpu"):
-    """Train for one epoch using pairwise contrastive loss.
+def train_epoch(model, dataloader, optimizer, device="cpu", scheduler=None):
+    """Train for one epoch using pairwise contrastive loss + in-batch negatives.
 
-    For each query, we have a positive and negative document. Score both
-    and use margin ranking loss.
+    Training uses two losses:
+    1. Triplet margin loss: uses model.forward() (full scoring including all
+       components) so all parameters get gradients.
+    2. In-batch negative cross-entropy: uses CQI-weighted MaxSim for clean
+       encoder gradients. The scoring innovations (ASC, MGS, TIR) get their
+       gradients from the triplet loss, while the encoder gets strong gradients
+       from both losses.
     """
     model.train()
     total_loss = 0
@@ -61,43 +66,39 @@ def train_epoch(model, dataloader, optimizer, device="cpu"):
         n_ids = n_tok["input_ids"].to(device)
         n_mask = n_tok["attention_mask"].to(device)
 
+        # Full model forward pass: all components get gradients
         pos_scores = model(q_ids, q_mask, p_ids, p_mask)
         neg_scores = model(q_ids, q_mask, n_ids, n_mask)
 
         # Pairwise margin ranking loss
         loss = F.relu(1.0 - pos_scores + neg_scores).mean()
 
-        # Also add in-batch negatives: each positive doc is a negative for
-        # other queries in the batch
+        # In-batch negatives: CQI-weighted MaxSim for clean encoder gradients
         batch_size = q_ids.shape[0]
         if batch_size > 1:
-            # Encode all queries and positive docs
             q_embs, q_masks = model.encoder(q_ids, q_mask)
             d_embs, d_masks = model.encoder(p_ids, p_mask)
 
-            # Compute all-pairs scores
+            # CQI importance if available
+            if hasattr(model, "cqi") and model.cqi is not None:
+                importances = model.cqi(q_embs, q_masks)
+            else:
+                importances = q_masks.float()
+
             all_scores = []
             for i in range(batch_size):
                 row_scores = []
                 for j in range(batch_size):
-                    if hasattr(model, "cqi") and model.cqi is not None:
-                        importance = model.cqi(
-                            q_embs[i].unsqueeze(0), q_masks[i].unsqueeze(0)
-                        ).squeeze(0)
-                        from ..scoring.fluke_scoring import importance_weighted_maxsim
-                        ws, pts = importance_weighted_maxsim(
-                            q_embs[i], d_embs[j], importance,
-                            q_masks[i], d_masks[j],
-                        )
-                        s = ws.sum()
-                    else:
-                        from ..scoring.maxsim import maxsim
-                        s = maxsim(q_embs[i], d_embs[j], q_masks[i], d_masks[j])
-                    row_scores.append(s)
+                    # CQI-weighted MaxSim (fast, clean gradients for encoder+CQI)
+                    from ..scoring.fluke_scoring import importance_weighted_maxsim
+                    ws, _, _, _ = importance_weighted_maxsim(
+                        q_embs[i], d_embs[j], importances[i],
+                        q_masks[i], d_masks[j],
+                    )
+                    row_scores.append(ws.sum())
                 all_scores.append(torch.stack(row_scores))
-            score_matrix = torch.stack(all_scores)  # (batch, batch)
+            score_matrix = torch.stack(all_scores)
 
-            # Cross-entropy loss: diagonal should be highest
             labels = torch.arange(batch_size, device=device)
             ib_loss = F.cross_entropy(score_matrix, labels)
             loss = loss + ib_loss
@@ -106,6 +107,8 @@ def train_epoch(model, dataloader, optimizer, device="cpu"):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         total_loss += loss.item()
         num_batches += 1
@@ -113,19 +116,11 @@ def train_epoch(model, dataloader, optimizer, device="cpu"):
     return total_loss / max(num_batches, 1)
 
 
-def train_model(
-    model,
-    triplets: list[tuple[str, str, str]],
-    num_epochs: int = 3,
-    batch_size: int = 16,
-    lr: float = 3e-6,
-    device: str = "cpu",
-):
-    """Full training loop."""
+def _make_dataloader(model, triplets, batch_size):
+    """Create a DataLoader from triplets using the model's tokenizer."""
     dataset = TripletDataset(triplets)
     tokenizer = model.encoder.tokenizer
-
-    dataloader = DataLoader(
+    return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
@@ -136,11 +131,109 @@ def train_model(
         ),
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+def _get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps):
+    """Cosine LR schedule with linear warmup."""
+    from torch.optim.lr_scheduler import LambdaLR
+    import math
+
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(
+            max(1, num_training_steps - num_warmup_steps)
+        )
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    return LambdaLR(optimizer, lr_lambda)
+
+
+def train_model(
+    model,
+    triplets: list[tuple[str, str, str]],
+    num_epochs: int = 3,
+    batch_size: int = 16,
+    lr: float = 3e-6,
+    device: str = "cpu",
+    use_lr_schedule: bool = False,
+    warmup_fraction: float = 0.1,
+):
+    """Full training loop with optional cosine LR schedule."""
+    dataloader = _make_dataloader(model, triplets, batch_size)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+
+    scheduler = None
+    if use_lr_schedule:
+        total_steps = len(dataloader) * num_epochs
+        warmup_steps = int(total_steps * warmup_fraction)
+        scheduler = _get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
     model.to(device)
     for epoch in range(num_epochs):
-        avg_loss = train_epoch(model, dataloader, optimizer, device)
+        avg_loss = train_epoch(model, dataloader, optimizer, device, scheduler=scheduler)
         print(f"Epoch {epoch + 1}/{num_epochs} — Loss: {avg_loss:.4f}")
+
+    return model
+
+
+def train_model_two_stage(
+    model,
+    triplets: list[tuple[str, str, str]],
+    stage1_epochs: int = 4,
+    stage2_epochs: int = 4,
+    batch_size: int = 16,
+    stage1_lr: float = 5e-5,
+    stage2_lr: float = 1e-5,
+    device: str = "cpu",
+):
+    """Two-stage training for FLUKE+ (and models with many scoring components).
+
+    Stage 1: Freeze scoring components (CQI, TIR, MGS, ASC), train only the
+        encoder. The zero-initialized scoring components make the model behave
+        like ColBERTv2, giving the encoder a clean learning signal.
+
+    Stage 2: Unfreeze everything and fine-tune at lower LR. The encoder is
+        already well-trained, so the scoring components can learn meaningful
+        corrections on top of good representations.
+
+    This avoids the optimization difficulty of jointly training 5+ components
+    from scratch, which causes slow convergence for FLUKE+.
+    """
+    dataloader = _make_dataloader(model, triplets, batch_size)
+    model.to(device)
+
+    # Identify scoring component parameters
+    scoring_component_names = {'cqi', 'tir', 'mgs', 'asc', 'tir_gate', 'ngram_scale'}
+
+    def _is_scoring_param(name):
+        return any(comp in name.split('.') or name.startswith(comp + '.')
+                    or name == comp for comp in scoring_component_names)
+
+    # Stage 1: Freeze scoring components
+    frozen_params = []
+    for name, param in model.named_parameters():
+        if _is_scoring_param(name):
+            param.requires_grad = False
+            frozen_params.append(name)
+
+    encoder_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer1 = torch.optim.AdamW(encoder_params, lr=stage1_lr, weight_decay=0.01)
+
+    print(f"  Stage 1: Training encoder ({len(encoder_params)} param groups, "
+          f"{len(frozen_params)} frozen)")
+    for epoch in range(stage1_epochs):
+        avg_loss = train_epoch(model, dataloader, optimizer1, device)
+        print(f"    Stage 1 Epoch {epoch + 1}/{stage1_epochs} — Loss: {avg_loss:.4f}")
+
+    # Stage 2: Unfreeze all, lower LR
+    for name, param in model.named_parameters():
+        param.requires_grad = True
+
+    optimizer2 = torch.optim.AdamW(model.parameters(), lr=stage2_lr, weight_decay=0.01)
+
+    print(f"  Stage 2: Fine-tuning all components (lr={stage2_lr})")
+    for epoch in range(stage2_epochs):
+        avg_loss = train_epoch(model, dataloader, optimizer2, device)
+        print(f"    Stage 2 Epoch {epoch + 1}/{stage2_epochs} — Loss: {avg_loss:.4f}")
 
     return model
