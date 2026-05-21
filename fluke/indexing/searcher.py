@@ -52,6 +52,7 @@ class LatentSearcher:
         nq = query_embs.shape[0]
         return max(self.topk_min, min(round(nq * self.topk_ratio), self.topk_cap))
 
+    @torch.no_grad()
     def search(
         self,
         query_embs: torch.Tensor,

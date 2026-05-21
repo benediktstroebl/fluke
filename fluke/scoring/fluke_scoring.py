@@ -78,15 +78,14 @@ def importance_weighted_maxsim(
     per_token_std = None
 
     if topk is not None:
-        # Use soft top-K aggregation
-        scores = []
-        for i in range(query_embeddings.shape[0]):
-            s = soft_topk_sim(
-                query_embeddings[i], doc_embeddings, k=topk,
-                temperature=temperature, doc_mask=doc_mask,
-            )
-            scores.append(s)
-        per_token_scores = torch.stack(scores)
+        # Vectorized soft top-K aggregation
+        sim_matrix = query_embeddings @ doc_embeddings.T  # (nq, nd)
+        if doc_mask is not None:
+            sim_matrix = sim_matrix.masked_fill(~doc_mask.unsqueeze(0), float("-inf"))
+        actual_k = min(topk, sim_matrix.shape[1])
+        topk_sims, _ = sim_matrix.topk(actual_k, dim=-1)  # (nq, k)
+        weights = F.softmax(topk_sims / temperature, dim=-1)  # (nq, k)
+        per_token_scores = (weights * topk_sims).sum(dim=-1)  # (nq,)
     else:
         # Standard hard MaxSim
         sim_matrix = query_embeddings @ doc_embeddings.T
@@ -217,34 +216,26 @@ def fluke_score(
         compute_stats=need_stats,
     )
 
-    # Discriminativeness-aware reweighting: upweight tokens whose best match
-    # stands out from their average similarity (high peak_above_mean = discriminative)
-    # This is document-dependent, unlike CQI which is query-only.
-    sim_matrix_disc = query_embeddings @ doc_embeddings.T
-    if doc_mask is not None:
-        valid_sims_disc = sim_matrix_disc.masked_fill(~doc_mask.unsqueeze(0), 0.0)
-        n_valid_disc = doc_mask.float().sum().clamp(min=1)
-        mean_disc = valid_sims_disc.sum(dim=-1) / n_valid_disc
+    if disc_scale > 0:
+        sim_matrix_disc = query_embeddings @ doc_embeddings.T
+        if doc_mask is not None:
+            valid_sims_disc = sim_matrix_disc.masked_fill(~doc_mask.unsqueeze(0), 0.0)
+            n_valid_disc = doc_mask.float().sum().clamp(min=1)
+            mean_disc = valid_sims_disc.sum(dim=-1) / n_valid_disc
+        else:
+            mean_disc = sim_matrix_disc.mean(dim=-1)
+        max_disc = sim_matrix_disc.max(dim=-1).values if doc_mask is None else \
+            sim_matrix_disc.masked_fill(~doc_mask.unsqueeze(0), float("-inf")).max(dim=-1).values
+        peak_above_mean = (max_disc - mean_disc).clamp(min=0)
+        pam_std = peak_above_mean.std().clamp(min=1e-6)
+        effective_scale = (disc_scale * pam_std).detach()
+        disc_weights = (1.0 + effective_scale * peak_above_mean).detach()
+        disc_weighted = weighted_scores * disc_weights
+        if query_mask is not None:
+            disc_weighted = disc_weighted * query_mask.float()
     else:
-        mean_disc = sim_matrix_disc.mean(dim=-1)
-    max_disc = sim_matrix_disc.max(dim=-1).values if doc_mask is None else \
-        sim_matrix_disc.masked_fill(~doc_mask.unsqueeze(0), float("-inf")).max(dim=-1).values
-    # Peak above mean: how much the best match stands out
-    peak_above_mean = (max_disc - mean_disc).clamp(min=0)
-    # Self-calibrating per-token discriminativeness: the effective scale adapts
-    # to PAM variance. When variance is high (diverse-topic BEIR queries),
-    # discriminative tokens get strong selective boosting. When variance is low
-    # (domain-specific LoTTE queries where all tokens have similar PAM), the
-    # effect auto-attenuates to preserve rankings.
-    pam_std = peak_above_mean.std().clamp(min=1e-6)
-    effective_scale = (disc_scale * pam_std).detach()
-    disc_weights = (1.0 + effective_scale * peak_above_mean).detach()
-    disc_weighted = weighted_scores * disc_weights
-    if query_mask is not None:
-        disc_weighted = disc_weighted * query_mask.float()
+        disc_weighted = weighted_scores
 
-    # Coverage quality factor: multiplicative bonus when all query concepts
-    # are well-matched. Helps domain-specific queries where every term matters.
     cov_factor = torch.tensor(1.0, device=weighted_scores.device)
     if coverage_weight > 0:
         active = disc_weighted[query_mask] if query_mask is not None else disc_weighted
