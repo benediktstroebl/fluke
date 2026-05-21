@@ -183,9 +183,9 @@ def fluke_score(
     topk: int = 3,
     temperature: float = 0.1,
     max_query_tokens: int = 32,
-    disc_scale: float = 3.0,
+    disc_scale: float = 0.0,
     disc_range: tuple[float, float] = (0.5, 1.5),
-    coverage_weight: float = 0.15,
+    coverage_weight: float = 0.0,
 ) -> torch.Tensor:
     """Complete FLUKE scoring function.
 
@@ -231,27 +231,30 @@ def fluke_score(
         sim_matrix_disc.masked_fill(~doc_mask.unsqueeze(0), float("-inf")).max(dim=-1).values
     # Peak above mean: how much the best match stands out
     peak_above_mean = (max_disc - mean_disc).clamp(min=0)
-    # Additive discriminativeness bonus: reward documents where query tokens
-    # find specific, distinctive matches (high peak_above_mean). Unlike
-    # multiplicative reweighting, this never penalizes any tokens —
-    # it only adds a bonus proportional to match specificity.
-    nq_active = int(query_mask.float().sum().item()) if query_mask is not None else query_embeddings.shape[0]
-    disc_bonus = peak_above_mean.sum() / max(nq_active, 1) * disc_scale
+    # Self-calibrating per-token discriminativeness: the effective scale adapts
+    # to PAM variance. When variance is high (diverse-topic BEIR queries),
+    # discriminative tokens get strong selective boosting. When variance is low
+    # (domain-specific LoTTE queries where all tokens have similar PAM), the
+    # effect auto-attenuates to preserve rankings.
+    pam_std = peak_above_mean.std().clamp(min=1e-6)
+    effective_scale = (disc_scale * pam_std).detach()
+    disc_weights = (1.0 + effective_scale * peak_above_mean).detach()
+    disc_weighted = weighted_scores * disc_weights
+    if query_mask is not None:
+        disc_weighted = disc_weighted * query_mask.float()
 
-    # Coverage scoring: reward documents where all query tokens match well.
-    # Computes min/mean ratio of per-token scores — high coverage means even
-    # the worst-matching token is close to the average (all concepts present).
-    # Critical for domain-specific queries (LoTTE) where every term matters.
-    coverage_bonus = torch.tensor(0.0, device=weighted_scores.device)
+    # Coverage quality factor: multiplicative bonus when all query concepts
+    # are well-matched. Helps domain-specific queries where every term matters.
+    cov_factor = torch.tensor(1.0, device=weighted_scores.device)
     if coverage_weight > 0:
-        active = weighted_scores[query_mask] if query_mask is not None else weighted_scores
+        active = disc_weighted[query_mask] if query_mask is not None else disc_weighted
         if active.numel() > 1:
             min_s = active.min()
             mean_s = active.mean().clamp(min=1e-6)
             coverage = (min_s / mean_s).clamp(0, 1)
-            coverage_bonus = coverage_weight * coverage * active.sum()
+            cov_factor = (1.0 + coverage_weight * coverage).detach()
 
-    base_score = weighted_scores.sum() + disc_bonus.detach() + coverage_bonus.detach()
+    base_score = disc_weighted.sum() * cov_factor
 
     if tir_module is not None:
         # Pad per_token_scores to fixed size for TIR

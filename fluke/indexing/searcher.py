@@ -28,9 +28,9 @@ class LatentSearcher:
         topk_ratio: float = 0.3,
         topk_cap: int = 6,
         topk_min: int = 3,
-        disc_scale: float = 3.0,
+        disc_scale: float = 0.0,
         disc_range: tuple[float, float] = (0.5, 1.5),
-        coverage_weight: float = 0.15,
+        coverage_weight: float = 0.0,
     ):
         self.index = index
         self.scoring = scoring

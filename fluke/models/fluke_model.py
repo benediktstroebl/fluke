@@ -116,9 +116,9 @@ class FLUKEModel(nn.Module):
         use_tir: bool = True,
         use_cqi: bool = True,
         use_soft_topk: bool = True,
-        disc_scale: float = 3.0,
+        disc_scale: float = 0.0,
         disc_range: tuple[float, float] = (0.5, 1.5),
-        coverage_weight: float = 0.15,
+        coverage_weight: float = 0.0,
     ):
         super().__init__()
         self.encoder = TokenEncoder(model_name, embedding_dim)
